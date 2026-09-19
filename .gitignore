@@ -1,0 +1,19 @@
+# ========================
+# Secrets & Environment
+# ========================
+.env
+*.env.*
+!.env.example
+
+# ========================
+# Go Artifacts
+# ========================
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
