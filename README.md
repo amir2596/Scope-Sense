@@ -1,6 +1,6 @@
 # ScopeSense
 
-An AI layer for freelance marketplaces (Upwork-style): it turns a vague client description into a structured technical spec, and estimates whether the client's stated budget is realistic based on similar past projects.
+An AI layer for freelance marketplaces : it turns a vague client description into a structured technical spec, and estimates whether the client's stated budget is realistic based on similar past projects.
 1. A clarification agent that turns a vague client description into a
    structured spec (scope, tech stack, deliverables) plus clarifying
    questions.
