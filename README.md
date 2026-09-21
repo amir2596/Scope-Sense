@@ -2,32 +2,95 @@
 
 ![ScopeSense demo](docs/ScopeSense.gif)
 
-An AI layer for freelance marketplaces : it turns a vague client description into a structured technical spec, and estimates whether the client's stated budget is realistic based on similar past projects.
-1. A clarification agent that turns a vague client description into a
-   structured spec (scope, tech stack, deliverables) plus clarifying
-   questions.
-2. A RAG-grounded "budget sanity check" that retrieves similar past
-   projects and compares the client's stated budget against real
-   closing prices.
+Freelance clients on platforms like Upwork routinely write vague, one-line
+project descriptions and attach unrealistic budgets — and freelancers waste
+real time going back and forth to figure out whether a lead is even worth
+pursuing. ScopeSense is a small agentic pipeline that takes a raw client
+description and turns it into a structured spec, a data-backed price
+range from similar past projects, and a plain-language verdict on whether
+the stated budget is realistic.
 
-Runs entirely on local, open-source models via Ollama — no cloud API
-key needed anywhere (chosen specifically to work from regions where
-OpenAI's API is not accessible).
+It runs entirely on local, open-source models via Ollama — no cloud API
+key, no per-request cost, and no dependency on a provider that may not be
+reachable from every region.
+
+## How it works
+
+1. **Clarify** — an LLM agent reads the raw description and extracts a
+   structured spec: scope, tech stack, deliverables, category, and any
+   clarifying questions a real freelancer would ask before quoting.
+2. **Embed + retrieve** — the structured spec is embedded and used to
+   search a Postgres/pgvector store of past closed projects for the
+   closest comparable deals, preferring same-category matches with a
+   fallback to a looser search if none are found.
+3. **Price check** — min/median/max price and a verdict
+   (`realistic` / `underpriced` / `overpriced` / `no_data`) are computed
+   with plain arithmetic against the retrieved comparables — no LLM
+   involved in this step, deliberately, since it doesn't need one.
+4. **Explain** (optional) — a second, smaller LLM call turns the verdict
+   and numbers into a short, plain-language explanation a client could
+   actually read.
+
+## Engineering decisions worth knowing about
+
+- **Prompt-injection defense.** The client's raw text is untrusted input —
+  it's wrapped in `<client_description>` tags and the system prompt
+  explicitly instructs the model to treat everything inside as data, never
+  as instructions, even if it contains phrases like "ignore previous
+  instructions." It's also capped at 2000 characters before it ever
+  reaches the model.
+- **Category-aware retrieval with a fallback.** Vector search filters by
+  the clarifier's detected category first (comparing a mobile app against
+  other mobile apps, not against unrelated web scraping gigs), and only
+  falls back to an unfiltered search if that strict match returns nothing
+  — better a looser comparison than no data at all.
+- **Bounded concurrency, not unbounded goroutines.** The API caps
+  concurrent evaluations at 4 via a semaphore, so a burst of requests
+  queues instead of overwhelming the local Ollama instance; a request
+  waiting for capacity respects its own cancellation instead of blocking
+  forever.
+- **Automatic model warm-up at startup.** Ollama unloads an idle model
+  from memory after 5 minutes by default, and a cold load can add 30-60+
+  seconds to whichever request happens to arrive first. The server pays
+  that cost once at startup instead of passing it on to a real user.
+- **Tuned for CPU inference, not just correctness.** Output length is
+  explicitly capped (`num_predict`) per call, since generation is
+  token-by-token and dominates latency on CPU far more than model size or
+  prompt length do.
+- **Model choice was revised, not just picked once.** Started with
+  `gemma4`, which turned out to be a multimodal build (vision + audio
+  encoders) adding real load time for capabilities this project never
+  uses; switched to the text-only `qwen2.5:7b-instruct` for faster,
+  lighter inference with no loss of JSON-following reliability.
+- **The verdict math is separate from the LLM calls on purpose** — a
+  wrong price threshold is a one-line fix and fully testable; keeping it
+  out of a prompt keeps the one part of the pipeline that must be exactly
+  right deterministic.
 
 ## Project layout
 
-- `cmd/seed` — one-off script that reads `seed_projects.json`, embeds
-  each entry, and loads it into Postgres. Run this once before
-  anything else.
+- `cmd/api` — the HTTP server (`/api/evaluate`, `/health`): request
+  validation, bounded concurrency, per-request timeout, startup model
+  warm-up, and request/response logging.
+- `cmd/evaluate` — a CLI entry point for running one evaluation directly,
+  without going through the HTTP server — useful for quick manual testing.
+- `cmd/seed` — one-off script that reads `seed_projects.json` (25 sample
+  closed projects), embeds each entry, and loads it into Postgres. Run
+  once before anything else.
 - `internal/project` — domain types and the `VectorStore`/`Embedder`
   interfaces. No framework or database dependency lives here.
-- `internal/vectorstore` — Postgres + pgvector implementation of
-  `VectorStore`.
+- `internal/agent` — the `ClarificationAgent` interface and its Ollama
+  implementation (the "Clarify" step above).
 - `internal/embedding` — `OllamaEmbedder` (local, active) and
-  `OpenAIEmbedder` (kept for reference, unused while OpenAI access is
-  unavailable).
-- `internal/agent` — `ClarificationAgent` interface and its Ollama
-  implementation.
+  `OpenAIEmbedder` (kept for reference, unused while cloud API access
+  isn't assumed to be available).
+- `internal/vectorstore` — the Postgres + pgvector implementation of
+  `VectorStore`.
+- `internal/pricing` — the `Service` that wires the above together: the
+  actual pipeline orchestration, the price-math, and the verdict logic.
+- `internal/explainer` — the optional "Explain" step's Ollama
+  implementation, kept as its own package (rather than folded into
+  `pricing`) to avoid a circular import between it and `agent`.
 - `migrations` — SQL to create the `projects` table.
 
 ## Setup
@@ -35,10 +98,10 @@ OpenAI's API is not accessible).
 1. **Install Ollama** — https://ollama.com, then pull the two local
    models this project uses:
    ```
-   ollama pull bge-m3       # embeddings, multilingual (Persian included)
-   ollama pull qwen2.5:7b-instruct   # reasoning / clarification agent (text-only, lighter than gemma4)
+   ollama pull bge-m3               # embeddings
+   ollama pull qwen2.5:7b-instruct  # clarification + explanation agent
    ```
-   Start the server (if not already running as a background service):
+   Start the server if it isn't already running as a background service:
    ```
    ollama serve
    ```
@@ -48,9 +111,10 @@ OpenAI's API is not accessible).
    docker run -d --name scopesense-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 pgvector/pgvector:pg16
    ```
 
-3. **Apply the migration:**
+3. **Apply the migration.** `psql` ships inside the container itself, so
+   run it via `docker exec` rather than needing it installed on your host:
    ```
-   psql "postgresql://postgres:postgres@localhost:5432/postgres" -f migrations/001_create_projects.sql
+   Get-Content migrations\001_create_projects.sql | docker exec -i scopesense-db psql -U postgres -d postgres
    ```
 
 4. **Set the one required environment variable** (no API key needed —
@@ -68,30 +132,38 @@ OpenAI's API is not accessible).
    go mod tidy
    go run ./cmd/seed
    ```
-   This embeds and stores all 15 entries from `seed_projects.json`.
 
-6. **The server warms both models up automatically on startup** (see `warmUpModels` in `cmd/api/main.go`), so the first real request doesn't pay the cold-load cost. Startup itself will take up to a minute or two the first time — that's expected, watch the log for `clarifier model warm` / `embedding model warm`.
+6. **Run the API server:**
+   ```
+   go run ./cmd/api
+   ```
+   Startup will take up to a minute or two the first time, since it warms
+   both models before accepting requests — watch for `clarifier model
+   warm` / `embedding model warm` in the log. Confirm it's up:
+   ```
+   curl http://localhost:8080/health
+   ```
 
-   During a session, Ollama still unloads an idle model after 5 minutes by default, so if you leave the server idle for a while mid-demo, the *next* request will be slow again even though startup warmed things up. To avoid that, set `OLLAMA_KEEP_ALIVE` **persistently** (System Properties → Environment Variables on Windows, not just `$env:` in one PowerShell session which only lasts until you close it) so it's in effect every time `ollama serve` starts:
+7. **Keep models warm between requests during a dev/demo session.**
+   Ollama's 5-minute idle unload still applies after startup, so if the
+   server sits idle for a while, set this **persistently** (System
+   Properties → Environment Variables on Windows — not just `$env:` in
+   one PowerShell session, which resets when you close it):
    ```
    OLLAMA_KEEP_ALIVE=60m
    ```
 
 ## Notes / open decisions
 
-- `bge-m3` was chosen over `nomic-embed-text` specifically because it
-  supports Persian; the embedding dimension (1024) in the migration
-  must match whatever embedding model is actually in use.
-- Switched from `gemma4` to `qwen2.5:7b-instruct` for the clarifier and
-  explainer: `gemma4` pulled a multimodal build (vision + audio encoders)
-  that added real load time and memory on CPU for capabilities this
-  project never uses. `qwen2.5:7b-instruct` is text-only, loads faster,
-  and is still strong at following instructions for structured JSON
-  output.
-- `Think: false` is set on clarification-agent requests; it's a no-op for
+- `bge-m3` is used for embeddings. No need to switch to a different
+  embedding model at this stage — doing so would mean re-seeding the
+  database (a different model changes the embedding dimension, which
+  the migration's vector column is fixed to) for a benefit that's
+  mostly theoretical.
+- `Think: false` is set on clarifier requests; it's a no-op for
   `qwen2.5:7b-instruct` (not a reasoning model) but is left in place in
   case the model is swapped for one that emits a reasoning block, which
   would otherwise break JSON parsing.
-- Not yet built: the pricing/retrieval step that combines the
-  clarification agent's output with a `VectorStore.Search` call, and
-  the Flutter client.
+- No automated tests yet. The pricing/verdict math in `internal/pricing`
+  is the highest-value, lowest-effort place to start, since it's pure
+  functions with no LLM or network dependency.
